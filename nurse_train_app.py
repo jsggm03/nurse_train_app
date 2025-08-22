@@ -29,8 +29,8 @@ DEFAULT_EMBED = "text-embedding-3-large"
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ▶▶ 깃허브에 올려둔 기본 엑셀 경로 (원하는 파일명/경로로 바꾸세요)
-DEFAULT_XLS_PATH = "assets/간호사교육_질의응답자료_근무지별.xlsx"
+# 리포 루트에 엑셀을 둔 경우
+DEFAULT_XLS_PATH = "간호사교육_질의응답자료_근무지별.xlsx"
 
 # =========================
 # 유틸
@@ -661,3 +661,4 @@ else:  # 코치(지도)
                 st.write(coaching2)
     else:
         st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
+
