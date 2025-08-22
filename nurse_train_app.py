@@ -227,13 +227,13 @@ def load_precomputed_embeddings(path: str) -> pd.DataFrame:
     df["embedding"] = df["embedding"].apply(safe_parse_embedding)
     return df
 
-def pick_precomputed_cache(embed_model: str) -> Optional[str]:
+# ▶ 캐시 선택: 현재 엑셀 MD5가 같은 것만 고르기 (없으면 None)
+def pick_precomputed_cache(embed_model: str, file_md5: Optional[str] = None) -> Optional[str]:
     pattern = os.path.join(DATA_DIR, f"embed__{embed_model}__*.csv")
     candidates = glob(pattern)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return candidates[0]
+    if file_md5:
+        candidates = [p for p in candidates if f"__{file_md5}__" in os.path.basename(p)]
+    return max(candidates, key=os.path.getmtime) if candidates else None
 
 # =========================
 # 케이스 카탈로그 (자동 제시용)
@@ -464,6 +464,10 @@ with st.sidebar:
     st.markdown("### ⚙️ 설정")
     EMBED_MODEL = st.selectbox("임베딩 모델", EMBED_OPTIONS, index=EMBED_OPTIONS.index(DEFAULT_EMBED))
     mode = st.radio("모드 선택", ["질문(학습)", "퀴즈(평가)", "코치(지도)"], index=0)
+
+    # ✅ 매핑/재생성 모드 토글 (캐시 무시)
+    force_rebuild = st.checkbox("매핑/재생성 모드(캐시 무시)", value=False)
+
     workplace_box = st.empty()  # 동적 프리셋 자리
     st.caption("근무지에 따라 어휘/톤/우선순위를 조절합니다. (데이터에서 자동 추출)")
     st.divider()
@@ -506,8 +510,15 @@ forb_prompt = forbidden_as_prompt(forbidden_df)
 
 # =========================
 # 미리 계산된 임베딩 CSV 우선 사용(있으면)
+# - force_rebuild 켜면: 항상 매핑 UI
+# - 아니면: 현재 엑셀과 MD5가 같은 캐시만 사용
 # =========================
-precomputed = pick_precomputed_cache(EMBED_MODEL)
+current_md5 = md5_of_bytes(xls_bytes)
+precomputed = None if force_rebuild else pick_precomputed_cache(EMBED_MODEL, file_md5=current_md5)
+
+if force_rebuild:
+    st.session_state["excel_df"] = None  # 매핑 화면 강제 오픈
+
 if uploaded is None and st.session_state["excel_df"] is None and precomputed:
     st.session_state["excel_df"] = load_precomputed_embeddings(precomputed)
     st.success(f"📦 사전 계산 임베딩 사용: {os.path.basename(precomputed)}")
@@ -830,3 +841,4 @@ else:  # 코치(지도)
                 st.write(coaching2)
     else:
         st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
+
