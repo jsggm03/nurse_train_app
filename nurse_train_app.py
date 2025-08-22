@@ -300,7 +300,7 @@ def make_messages_for_answer(topk: pd.DataFrame, user_query: str, workplace: str
         docs.append(
             f"[doc {i+1}] sheet={r['sheet']} | row={r['row_index']} | sim={r.get('similarity',1.0):.4f}\n"
             f"컨텍스트: {trim(r['context'])}\n"
-            f"표준응답: {trim(r['answer'])}"
+            f"표준응답: {trim(r['answer']})"
         )
     joined = "\n\n".join(docs)
     system = (
@@ -415,14 +415,14 @@ def extract_scripts_from_coaching(coaching_markdown: str) -> Dict[str, str]:
     }
 
 # =========================
-# 사이드바(공통)
+# 사이드바(공통) — 근무지 프리셋은 추후 동적 렌더
 # =========================
 with st.sidebar:
     st.markdown("### ⚙️ 설정")
     EMBED_MODEL = st.selectbox("임베딩 모델", EMBED_OPTIONS, index=EMBED_OPTIONS.index(DEFAULT_EMBED))
     mode = st.radio("모드 선택", ["질문(학습)", "퀴즈(평가)", "코치(지도)"], index=0)
-    workplace = st.selectbox("근무지 프리셋(톤)", ["일반병동", "응급실", "수술실", "외래", "소아과"], index=0)
-    st.caption("근무지에 따라 어휘/톤/우선순위를 조절합니다.")
+    workplace_box = st.empty()  # 동적 프리셋 자리
+    st.caption("근무지에 따라 어휘/톤/우선순위를 조절합니다. (데이터에서 자동 추출)")
     st.divider()
     uploaded = st.file_uploader("엑셀 업로드 (.xlsx) — 업로드 없으면 기본 파일 자동 사용", type=["xlsx"])
     sheet_input = st.text_input("사용할 시트명(비우면 첫 시트)", value="")
@@ -436,7 +436,8 @@ defaults = {
     "coaching_text": "", "catalog": None, "active_sheet": None,
     "revealed_quiz": False, "revealed_coach": False,
     "draft_text": "",
-    "case_order": [], "case_pos": -1, "filter_sig": ""
+    "case_order": [], "case_pos": -1, "filter_sig": "",
+    "workplace_tone": ""
 }
 for k, v in defaults.items():
     if k not in st.session_state: st.session_state[k] = v
@@ -517,9 +518,24 @@ if df_embed is None:
     st.info("먼저 **임베딩 캐시 생성/로드**를 완료하세요.")
     st.stop()
 
-# 컨텍스트에서 근무지(병동) 컬럼 추출 (한 번만)
+# 컨텍스트에서 근무지(병동) 태그 추출 + 프리셋 동적 구성
 if "ward" not in df_embed.columns:
     df_embed["ward"] = df_embed["context"].apply(lambda c: extract_tag_value(c, ["병동","근무지","부서","카테고리"]))
+ward_options_dynamic = sorted([w for w in df_embed["ward"].dropna().unique().tolist() if str(w).strip()])
+if not ward_options_dynamic:
+    ward_options_dynamic = ["공통"]
+# 사이드바 자리(workplace_box)에 동적 selectbox 렌더
+workplace = workplace_box.selectbox("근무지 프리셋(톤)", ward_options_dynamic, index=0, key="workplace_tone")
+
+def workplace_for(top1=None) -> str:
+    sel = st.session_state.get("workplace_tone", "")
+    if sel:
+        return sel
+    if top1 is not None:
+        w = (top1.get("ward") or "").strip()
+        if w:
+            return w
+    return "공통"
 
 # 카탈로그 만들기 (자동 제시용)
 if uploaded is None or 'preview_df' not in locals():
@@ -532,7 +548,7 @@ st.divider()
 st.title("🩺 간호사 교육용 챗봇 (Excel RAG + Coach)")
 
 # =========================
-# 공통: 케이스 자동 제시(없으면 랜덤) + 출제 옵션
+# 공통: 출제/필터 로직
 # =========================
 def get_filtered_catalog(_catalog: pd.DataFrame, ward_choice: str) -> pd.DataFrame:
     if not _catalog is None and not _catalog.empty and ward_choice and ward_choice != "전체":
@@ -544,7 +560,7 @@ def rebuild_order_if_needed(filtered: pd.DataFrame, shuffle: bool, ward_choice: 
     sig = json.dumps({"ward": ward_choice, "shuffle": shuffle, "mode": mode_tag})
     if st.session_state["filter_sig"] != sig:
         st.session_state["filter_sig"] = sig
-        order = filtered["row_index"].astype(int).tolist()
+        order = filtered["row_index"].astype(int).tolist() if filtered is not None else []
         if shuffle:
             random.shuffle(order)
         st.session_state["case_order"] = order
@@ -600,7 +616,7 @@ if mode == "질문(학습)":
     if send and q.strip():
         topk = search_top_k(df_embed, q.strip(), k=3)
         st.session_state["last_topk"] = topk
-        msgs = make_messages_for_answer(topk, q.strip(), workplace, forb_prompt)
+        msgs = make_messages_for_answer(topk, q.strip(), workplace_for(), forb_prompt)
         ans = call_llm(msgs)
         message(q.strip(), is_user=True, key="ask_u_"+str(time.time()))
         message(ans, key="ask_b_"+str(time.time()))
@@ -610,7 +626,7 @@ if mode == "질문(학습)":
 
 elif mode == "퀴즈(평가)":
     # 출제 옵션 (근무지 필터 + 순차/랜덤)
-    ward_options = ["전체"] + sorted([w for w in df_embed["ward"].dropna().unique().tolist() if str(w).strip()])
+    ward_options = ["전체"] + ward_options_dynamic
     opt_col1, opt_col2, opt_col3 = st.columns([2,1,1])
     with opt_col1:
         ward_choice = st.selectbox("근무지(병동)로 필터", ward_options, index=0, key="ward_quiz")
@@ -622,7 +638,6 @@ elif mode == "퀴즈(평가)":
     filtered_catalog = get_filtered_catalog(catalog, st.session_state.get("ward_quiz","전체"))
     st.caption(f"가용 문항: {0 if filtered_catalog is None else len(filtered_catalog)}개")
 
-    # 순차 출제 준비(필요시)
     rebuild_order_if_needed(filtered_catalog, shuffle=False, ward_choice=st.session_state.get("ward_quiz","전체"), mode_tag="quiz")
 
     if btn_next:
@@ -632,7 +647,6 @@ elif mode == "퀴즈(평가)":
 
     ensure_case_selected(filtered_catalog)
 
-    # 사용자 선택 그리드 (필터 반영)
     chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=9)
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
@@ -648,7 +662,7 @@ elif mode == "퀴즈(평가)":
             user_answer = st.text_area("훈련생 답변", height=180)
             btn_eval = st.form_submit_button("평가 요청")
         if btn_eval:
-            msgs = make_messages_for_quiz(top1, (user_answer or "").strip(), workplace, forb_prompt)
+            msgs = make_messages_for_quiz(top1, (user_answer or "").strip(), workplace_for(top1), forb_prompt)
             feedback = call_llm(msgs)
             st.markdown("### 🧪 평가 결과")
             st.write(feedback)
@@ -661,7 +675,7 @@ elif mode == "퀴즈(평가)":
 
 else:  # 코치(지도)
     # 출제 옵션 (근무지 필터 + 순차/랜덤)
-    ward_options = ["전체"] + sorted([w for w in df_embed["ward"].dropna().unique().tolist() if str(w).strip()])
+    ward_options = ["전체"] + ward_options_dynamic
     opt_col1, opt_col2, opt_col3 = st.columns([2,1,1])
     with opt_col1:
         ward_choice = st.selectbox("근무지(병동)로 필터", ward_options, index=0, key="ward_coach")
@@ -673,7 +687,6 @@ else:  # 코치(지도)
     filtered_catalog = get_filtered_catalog(catalog, st.session_state.get("ward_coach","전체"))
     st.caption(f"가용 문항: {0 if filtered_catalog is None else len(filtered_catalog)}개")
 
-    # 순차 출제 준비(필요시)
     rebuild_order_if_needed(filtered_catalog, shuffle=False, ward_choice=st.session_state.get("ward_coach","전체"), mode_tag="coach")
 
     if btn_next:
@@ -683,7 +696,6 @@ else:  # 코치(지도)
 
     ensure_case_selected(filtered_catalog)
 
-    # 사용자 선택 그리드 (필터 반영)
     chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=9)
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
@@ -711,7 +723,7 @@ else:  # 코치(지도)
 
         if auto_draft:
             msgs_draft = [
-                {"role":"system","content":f"간호사 커뮤니케이션 코치입니다. 근무지: {workplace}. 표준응답을 참고해 한국어로 1~2문장 정중한 안내 스크립트를 만들어 주세요."},
+                {"role":"system","content":f"간호사 커뮤니케이션 코치입니다. 근무지: {workplace_for(top1)}. 표준응답을 참고해 한국어로 1~2문장 정중한 안내 스크립트를 만들어 주세요."},
                 {"role":"user","content": f"[표준응답]\n{top1['answer']}\n\n출력: 공손하고 명확한 1~2문장"}
             ]
             draft_text = call_llm(msgs_draft, max_output_tokens=200, temperature=0.2)
@@ -720,7 +732,7 @@ else:  # 코치(지도)
 
         if btn_coach:
             base_text = (user_answer or "").strip() or (st.session_state["draft_text"] or "").strip()
-            msgs = make_messages_for_coach(top1, base_text, workplace, tone, forb_prompt)
+            msgs = make_messages_for_coach(top1, base_text, workplace_for(top1), tone, forb_prompt)
             coaching = call_llm(msgs, max_output_tokens=1200, temperature=0.25)
             st.session_state["coaching_text"] = coaching
             st.markdown("### 🧑‍🏫 코칭 결과")
@@ -755,7 +767,7 @@ else:  # 코치(지도)
             st.markdown("### ✍️ 다시 써보기 → 재코칭")
             revised = st.text_area("수정안(코칭을 반영해 다시 작성)", height=140, key="revised_text")
             if st.button("다시 코칭"):
-                msgs2 = make_messages_for_coach(top1, (revised or "").strip(), workplace, tone, forb_prompt)
+                msgs2 = make_messages_for_coach(top1, (revised or "").strip(), workplace_for(top1), tone, forb_prompt)
                 coaching2 = call_llm(msgs2, max_output_tokens=1200, temperature=0.25)
                 st.session_state["coaching_text"] = coaching2
                 st.markdown("### 🧑‍🏫 재코칭 결과")
