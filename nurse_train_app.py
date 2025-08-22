@@ -57,23 +57,31 @@ def _load_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
 
-# --- 근무지 정규화(표기 통일) ---
+# --- 근무지 표기 통일 / 나쁜 값 정리 ---
 WARD_MAP = {
     "일반병동": "병동분만실", "분만실": "병동분만실", "병동": "병동분만실",
     "소아과": "신생아부서", "신생아": "신생아부서", "NICU": "신생아부서",
 }
-def normalize_ward(s: str) -> str:
+BAD_WARD_VALUES = {"", "nan", "none", "null", "na", "n/a", "-", "—", "미상"}
+
+def clean_ward(s: str) -> str:
     s = str(s or "").strip()
+    return "" if s.lower() in BAD_WARD_VALUES else s
+
+def normalize_ward(s: str) -> str:
+    s = clean_ward(s)
+    if not s:
+        return ""
     s_flat = re.sub(r"\s+", "", s)
     return WARD_MAP.get(s_flat, s)
 
-# 컨텍스트 내 [키] 값 추출
+# 컨텍스트 내 [키] 값 추출 (클리닝 포함)
 def extract_tag_value(context_text: str, keys: List[str]) -> str:
     text = context_text or ""
     for k in keys:
         m = re.search(rf"\[{re.escape(k)}\]\s*([^|\n]+)", text)
         if m:
-            return m.group(1).strip()
+            return clean_ward(m.group(1))
     return ""
 
 # 답안이 섞여 있으면 컨텍스트에서 제거
@@ -83,7 +91,6 @@ def strip_answer_from_context(ctx: str, ans: str = "") -> str:
     s = str(ctx)
     # [표준응답] ... 또는 [정답] ... 같은 필드 통째로 제거 (파이프 구분자 고려)
     for k in ANSWER_KEYS:
-        # [키] 값 (뒤에 ' | '가 있을 수도)
         s = re.sub(rf"\[\s*{re.escape(k)}\s*\]\s*[^|\n]+(\s*\|\s*)?", "", s, flags=re.IGNORECASE)
     # 답안 텍스트가 그대로 들어가 있으면 제거
     if ans:
@@ -267,18 +274,19 @@ def build_catalog_from_embed(df_embed: pd.DataFrame) -> pd.DataFrame:
         seen.add(title); titles.append(title); rows.append(int(r["row_index"]))
     return pd.DataFrame({"case_title": titles, "row_index": rows})
 
-def render_case_shelf(catalog: pd.DataFrame, label="추천 케이스", max_items: int = 9) -> Optional[int]:
+def render_case_shelf(catalog: pd.DataFrame, label="다른 케이스 선택", show_all: bool = True, cols_count: int = 4) -> Optional[int]:
+    """필터된 카탈로그의 모든 항목을 버튼으로 표시 (show_all=True면 전부)."""
     if catalog is None or catalog.empty:
         return None
     st.markdown(f"#### 📚 {label}")
-    show = catalog.head(max_items).reset_index(drop=True)
-    cols = st.columns(3)
+    show = catalog.reset_index(drop=True) if show_all else catalog.head(24).reset_index(drop=True)
+    cols = st.columns(cols_count)
     chosen: Optional[int] = None
     for i, row in show.iterrows():
-        with cols[i % 3]:
-            if st.button("🔹 " + str(row["case_title"]), key=f"case_{i}"):
+        with cols[i % cols_count]:
+            if st.button("🔹 " + str(row["case_title"]), key=f"case_{label}_{i}"):
                 chosen = int(row["row_index"])
-    with st.expander("전체 목록 보기"):
+    with st.expander("전체 목록 보기 (표)"):
         st.dataframe(catalog)
     return chosen
 
@@ -539,6 +547,7 @@ if df_embed is None:
 # 컨텍스트에서 근무지(병동) 컬럼 추출 + 정규화
 if "ward" not in df_embed.columns:
     df_embed["ward"] = df_embed["context"].apply(lambda c: extract_tag_value(c, ["병동","근무지","부서","카테고리"]))
+df_embed["ward"] = df_embed["ward"].apply(clean_ward)
 df_embed["ward_norm"] = df_embed["ward"].apply(normalize_ward)
 
 # 카탈로그
@@ -564,7 +573,7 @@ def rebuild_order_if_needed(filtered: pd.DataFrame, shuffle: bool, ward_choice: 
     sig = json.dumps({"ward": ward_choice, "shuffle": shuffle, "mode": mode_tag})
     if st.session_state["filter_sig"] != sig:
         st.session_state["filter_sig"] = sig
-        order = filtered["row_index"].astype(int).tolist()
+        order = filtered["row_index"].astype(int).tolist() if filtered is not None else []
         if shuffle: random.shuffle(order)
         st.session_state["case_order"] = order
         st.session_state["case_pos"] = -1
@@ -625,7 +634,11 @@ if mode == "질문(학습)":
             st.dataframe(st.session_state["last_topk"][["sheet","row_index","similarity","context","answer"]])
 
 elif mode == "퀴즈(평가)":
-    ward_options = ["전체"] + sorted([w for w in df_embed["ward_norm"].dropna().unique().tolist() if str(w).strip()])
+    # 유효한 근무지 값만 추출
+    _valid = (df_embed["ward_norm"].fillna("").astype(str).str.strip())
+    _valid = _valid[~_valid.str.lower().isin(BAD_WARD_VALUES)]
+    ward_options = ["전체"] + sorted(_valid.unique().tolist())
+
     opt_col1, opt_col2, opt_col3 = st.columns([2,1,1])
     with opt_col1:
         ward_choice = st.selectbox("근무지(병동)로 필터", ward_options, index=0, key="ward_quiz")
@@ -643,7 +656,8 @@ elif mode == "퀴즈(평가)":
     if btn_rand: random_case(filtered_catalog)
     ensure_case_selected(filtered_catalog)
 
-    chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=9)
+    # ✅ 근무지별 모든 버튼을 전부 표시
+    chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", show_all=True, cols_count=4)
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
         st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
@@ -669,7 +683,10 @@ elif mode == "퀴즈(평가)":
         st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
 
 else:  # 코치(지도)
-    ward_options = ["전체"] + sorted([w for w in df_embed["ward_norm"].dropna().unique().tolist() if str(w).strip()])
+    _valid = (df_embed["ward_norm"].fillna("").astype(str).str.strip())
+    _valid = _valid[~_valid.str.lower().isin(BAD_WARD_VALUES)]
+    ward_options = ["전체"] + sorted(_valid.unique().tolist())
+
     opt_col1, opt_col2, opt_col3 = st.columns([2,1,1])
     with opt_col1:
         ward_choice = st.selectbox("근무지(병동)로 필터", ward_options, index=0, key="ward_coach")
@@ -687,7 +704,8 @@ else:  # 코치(지도)
     if btn_rand: random_case(filtered_catalog)
     ensure_case_selected(filtered_catalog)
 
-    chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=9)
+    # ✅ 근무지별 모든 버튼을 전부 표시
+    chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", show_all=True, cols_count=4)
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
         st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
