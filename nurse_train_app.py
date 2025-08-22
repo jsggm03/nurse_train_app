@@ -1,5 +1,5 @@
 # nurse_train_app.py
-import os, io, json, ast, re, time, hashlib, tempfile, random
+import os, io, json, ast, re, time, hashlib, tempfile
 from glob import glob
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -56,15 +56,6 @@ def safe_parse_embedding(x):
 def _load_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
-
-def extract_tag_value(context_text: str, keys: List[str]) -> str:
-    """컨텍스트 내 [키] 값 추출."""
-    text = context_text or ""
-    for k in keys:
-        m = re.search(rf"\[{re.escape(k)}\]\s*([^|\n]+)", text)
-        if m:
-            return m.group(1).strip()
-    return ""
 
 # 정답 공개 상태 리셋
 def reset_reveal_flags():
@@ -281,6 +272,7 @@ def call_llm(messages: List[Dict[str, str]], max_output_tokens: int = 900, tempe
         max_output_tokens=max_output_tokens,
         temperature=temperature,
     )
+    # 최대 호환 파싱
     try:
         return (resp.output_text or "").strip()
     except Exception:
@@ -415,13 +407,13 @@ def extract_scripts_from_coaching(coaching_markdown: str) -> Dict[str, str]:
     }
 
 # =========================
-# 사이드바(공통)
+# 사이드바
 # =========================
 with st.sidebar:
     st.markdown("### ⚙️ 설정")
     EMBED_MODEL = st.selectbox("임베딩 모델", EMBED_OPTIONS, index=EMBED_OPTIONS.index(DEFAULT_EMBED))
     mode = st.radio("모드 선택", ["질문(학습)", "퀴즈(평가)", "코치(지도)"], index=0)
-    workplace = st.selectbox("근무지 프리셋(톤)", ["일반병동", "응급실", "수술실", "외래", "소아과"], index=0)
+    workplace = st.selectbox("근무지 프리셋", ["일반병동", "응급실", "수술실", "외래", "소아과"], index=0)
     st.caption("근무지에 따라 어휘/톤/우선순위를 조절합니다.")
     st.divider()
     uploaded = st.file_uploader("엑셀 업로드 (.xlsx) — 업로드 없으면 기본 파일 자동 사용", type=["xlsx"])
@@ -434,9 +426,8 @@ with st.sidebar:
 defaults = {
     "excel_df": None, "last_topk": None, "context_cols": [], "answer_col": None,
     "coaching_text": "", "catalog": None, "active_sheet": None,
-    "revealed_quiz": False, "revealed_coach": False,
-    "draft_text": "",
-    "case_order": [], "case_pos": -1, "filter_sig": ""
+    "revealed_quiz": False, "revealed_coach": False,     # ⬅️ 정답 공개 플래그
+    "draft_text": ""
 }
 for k, v in defaults.items():
     if k not in st.session_state: st.session_state[k] = v
@@ -517,10 +508,6 @@ if df_embed is None:
     st.info("먼저 **임베딩 캐시 생성/로드**를 완료하세요.")
     st.stop()
 
-# 컨텍스트에서 근무지(병동) 컬럼 추출 (한 번만)
-if "ward" not in df_embed.columns:
-    df_embed["ward"] = df_embed["context"].apply(lambda c: extract_tag_value(c, ["병동","근무지","부서","카테고리"]))
-
 # 카탈로그 만들기 (자동 제시용)
 if uploaded is None or 'preview_df' not in locals():
     st.session_state["catalog"] = build_catalog_from_embed(df_embed)
@@ -532,49 +519,16 @@ st.divider()
 st.title("🩺 간호사 교육용 챗봇 (Excel RAG + Coach)")
 
 # =========================
-# 공통: 케이스 자동 제시(없으면 랜덤) + 출제 옵션
+# 공통: 케이스 자동 제시(없으면 랜덤)
 # =========================
-def get_filtered_catalog(_catalog: pd.DataFrame, ward_choice: str) -> pd.DataFrame:
-    if not _catalog is None and not _catalog.empty and ward_choice and ward_choice != "전체":
-        idxs = set(df_embed.loc[df_embed["ward"] == ward_choice, "row_index"].astype(int).tolist())
-        return _catalog[_catalog["row_index"].isin(list(idxs))].reset_index(drop=True)
-    return _catalog
-
-def rebuild_order_if_needed(filtered: pd.DataFrame, shuffle: bool, ward_choice: str, mode_tag: str):
-    sig = json.dumps({"ward": ward_choice, "shuffle": shuffle, "mode": mode_tag})
-    if st.session_state["filter_sig"] != sig:
-        st.session_state["filter_sig"] = sig
-        order = filtered["row_index"].astype(int).tolist()
-        if shuffle:
-            random.shuffle(order)
-        st.session_state["case_order"] = order
-        st.session_state["case_pos"] = -1
-        st.session_state["last_topk"] = None
-        reset_reveal_flags()
-
-def next_case(filtered: pd.DataFrame):
-    if filtered is None or filtered.empty:
-        return
-    if not st.session_state["case_order"]:
-        st.session_state["case_order"] = filtered["row_index"].astype(int).tolist()
-    st.session_state["case_pos"] = (st.session_state["case_pos"] + 1) % len(st.session_state["case_order"])
-    ridx = st.session_state["case_order"][st.session_state["case_pos"]]
-    sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
-    st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, ridx)
-    reset_reveal_flags()
-
-def random_case(filtered: pd.DataFrame):
-    if filtered is None or filtered.empty:
-        return
-    ridx = int(filtered.sample(1)["row_index"].iloc[0])
-    sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
-    st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, ridx)
-    reset_reveal_flags()
-
-def ensure_case_selected(filtered: pd.DataFrame):
+def ensure_case_selected():
     if st.session_state["last_topk"] is None:
-        if filtered is not None and not filtered.empty:
-            random_case(filtered)
+        if catalog is not None and not catalog.empty:
+            pick_row = int(catalog.sample(1)["row_index"].iloc[0])
+            sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
+            st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, pick_row)
+            reset_reveal_flags()  # 새 케이스면 정답 숨김
+            st.info(f"자동 제시된 케이스: {catalog[catalog['row_index']==pick_row]['case_title'].iloc[0]}")
 
 def show_case_header(top1: pd.Series, reveal_answer: bool):
     st.markdown("### 📄 케이스 요약")
@@ -609,31 +563,8 @@ if mode == "질문(학습)":
             st.dataframe(st.session_state["last_topk"][["sheet","row_index","similarity","context","answer"]])
 
 elif mode == "퀴즈(평가)":
-    # 출제 옵션 (근무지 필터 + 순차/랜덤)
-    ward_options = ["전체"] + sorted([w for w in df_embed["ward"].dropna().unique().tolist() if str(w).strip()])
-    opt_col1, opt_col2, opt_col3 = st.columns([2,1,1])
-    with opt_col1:
-        ward_choice = st.selectbox("근무지(병동)로 필터", ward_options, index=0, key="ward_quiz")
-    with opt_col2:
-        btn_next = st.button("다음 문제")
-    with opt_col3:
-        btn_rand = st.button("랜덤 출제")
-
-    filtered_catalog = get_filtered_catalog(catalog, st.session_state.get("ward_quiz","전체"))
-    st.caption(f"가용 문항: {0 if filtered_catalog is None else len(filtered_catalog)}개")
-
-    # 순차 출제 준비(필요시)
-    rebuild_order_if_needed(filtered_catalog, shuffle=False, ward_choice=st.session_state.get("ward_quiz","전체"), mode_tag="quiz")
-
-    if btn_next:
-        next_case(filtered_catalog)
-    if btn_rand:
-        random_case(filtered_catalog)
-
-    ensure_case_selected(filtered_catalog)
-
-    # 사용자 선택 그리드 (필터 반영)
-    chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=9)
+    ensure_case_selected()
+    chosen = render_case_shelf(catalog, label="다른 케이스 선택", max_items=9)
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
         st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
@@ -660,31 +591,8 @@ elif mode == "퀴즈(평가)":
         st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
 
 else:  # 코치(지도)
-    # 출제 옵션 (근무지 필터 + 순차/랜덤)
-    ward_options = ["전체"] + sorted([w for w in df_embed["ward"].dropna().unique().tolist() if str(w).strip()])
-    opt_col1, opt_col2, opt_col3 = st.columns([2,1,1])
-    with opt_col1:
-        ward_choice = st.selectbox("근무지(병동)로 필터", ward_options, index=0, key="ward_coach")
-    with opt_col2:
-        btn_next = st.button("다음 문제")
-    with opt_col3:
-        btn_rand = st.button("랜덤 출제")
-
-    filtered_catalog = get_filtered_catalog(catalog, st.session_state.get("ward_coach","전체"))
-    st.caption(f"가용 문항: {0 if filtered_catalog is None else len(filtered_catalog)}개")
-
-    # 순차 출제 준비(필요시)
-    rebuild_order_if_needed(filtered_catalog, shuffle=False, ward_choice=st.session_state.get("ward_coach","전체"), mode_tag="coach")
-
-    if btn_next:
-        next_case(filtered_catalog)
-    if btn_rand:
-        random_case(filtered_catalog)
-
-    ensure_case_selected(filtered_catalog)
-
-    # 사용자 선택 그리드 (필터 반영)
-    chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=9)
+    ensure_case_selected()
+    chosen = render_case_shelf(catalog, label="다른 케이스 선택", max_items=9)
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
         st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
@@ -719,6 +627,7 @@ else:  # 코치(지도)
             st.experimental_rerun()
 
         if btn_coach:
+            # 비워두면 사용자가 입력한 값 우선, 없으면 저장된 초안
             base_text = (user_answer or "").strip() or (st.session_state["draft_text"] or "").strip()
             msgs = make_messages_for_coach(top1, base_text, workplace, tone, forb_prompt)
             coaching = call_llm(msgs, max_output_tokens=1200, temperature=0.25)
