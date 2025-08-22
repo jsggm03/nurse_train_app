@@ -1,9 +1,12 @@
 # nurse_train_app.py
 import os, io, json, ast, re, time, hashlib, tempfile
+from glob import glob
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 from numpy.linalg import norm
-from typing import List, Dict, Optional, Tuple
 
 import streamlit as st
 from streamlit_chat import message
@@ -20,12 +23,14 @@ if not OPENAI_API_KEY:
     st.stop()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-CHAT_MODEL = "gpt-4o-mini"  # 생성/평가/코칭 공용
+CHAT_MODEL = "gpt-4o-mini"                      # 생성/평가/코칭 공용
 EMBED_OPTIONS = ["text-embedding-3-small", "text-embedding-3-large"]
 DEFAULT_EMBED = "text-embedding-3-large"
-
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
+
+# ▶▶ 깃허브에 올려둔 기본 엑셀 경로 (원하는 파일명/경로로 바꾸세요)
+DEFAULT_XLS_PATH = "assets/간호사교육_질의응답자료_근무지별.xlsx"
 
 # =========================
 # 유틸
@@ -42,6 +47,11 @@ def to_np(e): return np.array(e, dtype=np.float32)
 def safe_parse_embedding(x):
     try: return json.loads(x)
     except Exception: return ast.literal_eval(x)
+
+@st.cache_data
+def _load_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
 
 # =========================
 # 임베딩(자동 차원 감지)
@@ -65,7 +75,7 @@ def get_embedding(text: str) -> List[float]:
         return [0.0] * EMBED_DIM
 
 # =========================
-# 엑셀 로딩/컨텍스트 구성
+# 엑셀 → 컨텍스트 구성
 # =========================
 def guess_columns(df: pd.DataFrame) -> Tuple[List[str], Optional[str]]:
     cols = df.columns.tolist()
@@ -158,8 +168,103 @@ def build_or_load_embeddings_from_excel(
     st.success(f"✅ 임베딩 생성 완료 → {os.path.basename(cache_path)}")
     return df
 
+@st.cache_data(show_spinner=True)
+def load_precomputed_embeddings(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["embedding"] = df["embedding"].apply(safe_parse_embedding)
+    return df
+
+def pick_precomputed_cache(embed_model: str) -> Optional[str]:
+    pattern = os.path.join(DATA_DIR, f"embed__{embed_model}__*.csv")
+    candidates = glob(pattern)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
 # =========================
-# 검색 & 공용 LLM 호출
+# 케이스 카탈로그 (자동 제시용)
+# =========================
+TITLE_KEYS = ["평가항목","항목","주제","케이스","질문","제목","카테고리"]
+
+def build_catalog_from_preview(df: pd.DataFrame, answer_col: Optional[str]) -> pd.DataFrame:
+    """엑셀 원본 DF에서 케이스 타이틀을 뽑아 미리보기 카탈로그 생성."""
+    title_col = next((c for c in TITLE_KEYS if c in df.columns), None)
+    titles, rows = [], []
+    seen = set()
+    for ridx, row in df.iterrows():
+        if title_col and str(row.get(title_col,"")).strip():
+            t = str(row[title_col]).strip()
+        else:
+            # 타이틀이 없으면 답변/컨텍스트 일부로 대체
+            base = str(row.get(answer_col,"") or "")[:30] if answer_col else ""
+            if not base:
+                # 첫 문자열 열에서 일부
+                for c in df.columns:
+                    s = str(row.get(c,"") or "").strip()
+                    if s:
+                        base = s[:30]; break
+            t = base or f"Row {ridx}"
+        k = (t,)
+        if k in seen: 
+            continue
+        seen.add(k)
+        titles.append(t)
+        rows.append(ridx)
+    return pd.DataFrame({"case_title": titles, "row_index": rows})
+
+def build_catalog_from_embed(df_embed: pd.DataFrame) -> pd.DataFrame:
+    """임베딩 DF만 있을 때 컨텍스트에서 타이틀 추출."""
+    titles, rows = [], []
+    seen = set()
+    for _, r in df_embed.iterrows():
+        text = r["context"]
+        title = None
+        m = re.search(r"\[(평가항목|항목|주제|케이스|질문|제목|카테고리)\]\s*([^|\n]+)", text)
+        if m:
+            title = m.group(2).strip()[:40]
+        else:
+            ans = (r.get("answer") or "")[:40]
+            if ans:
+                title = ans
+            else:
+                title = (text[:40] if text else f"Row {r['row_index']}")
+        key = (title,)
+        if key in seen: 
+            continue
+        seen.add(key)
+        titles.append(title)
+        rows.append(int(r["row_index"]))
+    return pd.DataFrame({"case_title": titles, "row_index": rows})
+
+def render_case_shelf(catalog: pd.DataFrame, label="추천 케이스", max_items: int = 9) -> Optional[int]:
+    """카탈로그를 버튼 그리드로 렌더링하고 선택된 row_index를 반환."""
+    if catalog is None or catalog.empty:
+        return None
+    st.markdown(f"#### 📚 {label}")
+    show = catalog.head(max_items).reset_index(drop=True)
+    cols = st.columns(3)
+    chosen: Optional[int] = None
+    for i, row in show.iterrows():
+        with cols[i % 3]:
+            if st.button("🔹 " + str(row["case_title"]), key=f"case_{i}"):
+                chosen = int(row["row_index"])
+    with st.expander("전체 목록 보기"):
+        st.dataframe(catalog)
+    return chosen
+
+def select_case_by_row(df_embed: pd.DataFrame, sheet: str, row_index: int) -> pd.DataFrame:
+    sel = df_embed[(df_embed["sheet"]==sheet) & (df_embed["row_index"]==row_index)]
+    if len(sel)==0:
+        # sheet가 하나뿐이면 sheet 무시
+        sel = df_embed[df_embed["row_index"]==row_index]
+    if len(sel)==0:
+        # 최후: 그냥 첫 행
+        sel = df_embed.head(1)
+    return sel.head(1).reset_index(drop=True)
+
+# =========================
+# 검색 & LLM 호출
 # =========================
 def search_top_k(df: pd.DataFrame, query: str, k: int = 3) -> pd.DataFrame:
     q_emb = to_np(get_embedding(query))
@@ -189,7 +294,7 @@ def make_messages_for_answer(topk: pd.DataFrame, user_query: str, workplace: str
     docs = []
     for i, r in topk.iterrows():
         docs.append(
-            f"[doc {i+1}] sheet={r['sheet']} | row={r['row_index']} | sim={r['similarity']:.4f}\n"
+            f"[doc {i+1}] sheet={r['sheet']} | row={r['row_index']} | sim={r.get('similarity',1.0):.4f}\n"
             f"컨텍스트: {trim(r['context'])}\n"
             f"표준응답: {trim(r['answer'])}"
         )
@@ -275,44 +380,35 @@ def synthesize_tts(text: str) -> Optional[str]:
     txt = (text or "").strip()
     if not txt: return None
     try:
-        speech = client.audio.speech.create(
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        with client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
             voice="alloy",
             input=txt
-        )
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(speech.read())  # SDK가 bytes-like 제공
-        tmp.flush(); tmp.close()
-        return tmp.name
+        ) as resp:
+            resp.stream_to_file(tmp_path)
+        return str(tmp_path)
     except Exception as e:
         st.warning(f"TTS 생성 실패: {e}")
         return None
 
 def extract_scripts_from_coaching(coaching_markdown: str) -> Dict[str, str]:
-    """
-    코칭 결과 텍스트에서 '모범 답안', '대안 스크립트' 섹션을 러프하게 추출.
-    마크다운 헤더/리스트를 가정한 간단한 휴리스틱.
-    """
-    text = coaching_markdown
+    text = coaching_markdown or ""
     def grab(section_title: str) -> str:
         pat = re.compile(rf"{section_title}.*?(?:\n[-*]\s.*|\n\n.+)", re.IGNORECASE|re.DOTALL)
         m = pat.search(text)
         if not m: return ""
         block = m.group(0)
-        # 다음 큰 섹션 시작 전까지
-        nxt = re.split(r"\n#{1,3}\s|\n\d\)\s|\n[가-힣]+\)", block)[0]
-        return nxt.strip()
-    baseline = grab("모범 답안")
-    variants = grab("대안 스크립트")
-    # 더 깔끔하게: 첫 문단만
+        return block.strip()
     def first_para(s: str) -> str:
         s = s.strip()
         parts = re.split(r"\n\n+", s)
         return parts[0].strip() if parts else s
-    return {
-        "baseline": first_para(baseline),
-        "variants": first_para(variants)
-    }
+    baseline = first_para(grab("모범 답안"))
+    variants = first_para(grab("대안 스크립트"))
+    return {"baseline": baseline, "variants": variants}
 
 # =========================
 # 사이드바
@@ -324,80 +420,127 @@ with st.sidebar:
     workplace = st.selectbox("근무지 프리셋", ["일반병동", "응급실", "수술실", "외래", "소아과"], index=0)
     st.caption("근무지에 따라 어휘/톤/우선순위를 조절합니다.")
     st.divider()
-    uploaded = st.file_uploader("엑셀 업로드 (.xlsx)", type=["xlsx"])
-    sheet_input = st.text_input("질문/평가용 시트명(비우면 첫 시트)", value="")
+    uploaded = st.file_uploader("엑셀 업로드 (.xlsx) — 업로드 없으면 기본 파일 자동 사용", type=["xlsx"])
+    sheet_input = st.text_input("사용할 시트명(비우면 첫 시트)", value="")
     use_forbidden = st.toggle("금기 표현 시트(금기표현) 사용", value=True)
-    st.caption("시트명: '금기표현' / 열: 금기표현, 이유, 대체문구")
 
 # =========================
 # 상태 초기화
 # =========================
-for k, v in {
+defaults = {
     "excel_df": None, "last_topk": None, "context_cols": [], "answer_col": None,
-    "coaching_text": ""
-}.items():
+    "coaching_text": "", "catalog": None, "active_sheet": None
+}
+for k, v in defaults.items():
     if k not in st.session_state: st.session_state[k] = v
 
 # =========================
-# 본문
+# 기본 엑셀 자동 로드
 # =========================
-st.title("🩺 간호사 교육용 챗봇 (Excel RAG + Coach)")
-
 if uploaded is None:
-    st.info("왼쪽에서 엑셀(.xlsx)을 업로드하세요.")
-    st.stop()
-
-xls_bytes = uploaded.getvalue()
-
-# 미리보기
-try:
-    preview_xl = pd.ExcelFile(io.BytesIO(xls_bytes))
-    default_sheet = sheet_input or preview_xl.sheet_names[0]
-    preview_df = preview_xl.parse(default_sheet).fillna("")
-    st.write(f"**시트:** {default_sheet} / **행:** {len(preview_df)} / **열:** {len(preview_df.columns)}")
-    st.dataframe(preview_df.head(8))
-except Exception as e:
-    st.error(f"엑셀 미리보기 실패: {e}")
-    st.stop()
+    try:
+        xls_bytes = _load_bytes(DEFAULT_XLS_PATH)
+        st.info(f"업로드 없음 → 기본 파일 사용: {DEFAULT_XLS_PATH}")
+    except Exception as e:
+        st.error(f"기본 엑셀을 찾을 수 없습니다. 업로드하거나 경로를 확인하세요. ({e})")
+        st.stop()
+else:
+    xls_bytes = uploaded.getvalue()
 
 # 금기 시트
 forbidden_df = load_forbidden_sheet(xls_bytes) if use_forbidden else pd.DataFrame()
 forb_prompt = forbidden_as_prompt(forbidden_df)
 
-# 컬럼 매핑
-st.subheader("🧩 컬럼 매핑")
-cols = preview_df.columns.tolist()
-if not st.session_state["context_cols"] and not st.session_state["answer_col"]:
-    g_ctx, g_ans = guess_columns(preview_df)
-    st.session_state["context_cols"] = g_ctx
-    st.session_state["answer_col"] = g_ans
+# =========================
+# 미리 계산된 임베딩 CSV 우선 사용(있으면)
+# =========================
+precomputed = pick_precomputed_cache(EMBED_MODEL)
+if uploaded is None and st.session_state["excel_df"] is None and precomputed:
+    st.session_state["excel_df"] = load_precomputed_embeddings(precomputed)
+    st.success(f"📦 사전 계산 임베딩 사용: {os.path.basename(precomputed)}")
 
-sel_ctx = st.multiselect("컨텍스트로 합칠 열들", cols, default=[c for c in st.session_state["context_cols"] if c in cols])
-sel_ans = st.selectbox("표준응답(정답) 열", ["<선택 안 함>"] + cols,
-                       index=(0 if (st.session_state["answer_col"] not in cols) else (cols.index(st.session_state["answer_col"]) + 1)))
-st.caption("표준응답 열을 지정하면 평가/코치 품질이 크게 향상됩니다.")
-
-if st.button("이 매핑으로 임베딩 캐시 생성/로드"):
+# =========================
+# 미리보기 & 컬럼 매핑 (임베딩 DF가 아직 없을 때만)
+# =========================
+if st.session_state["excel_df"] is None:
     try:
-        st.session_state["excel_df"] = build_or_load_embeddings_from_excel(
-            xls_bytes=xls_bytes,
-            sheet_name=(sheet_input or None),
-            context_cols=sel_ctx if sel_ctx else cols[:3],
-            answer_col=(None if sel_ans == "<선택 안 함>" else sel_ans),
-            embed_model_name=EMBED_MODEL
-        )
-        st.session_state["context_cols"] = sel_ctx if sel_ctx else cols[:3]
-        st.session_state["answer_col"] = (None if sel_ans == "<선택 안 함>" else sel_ans)
-        st.success("임베딩 데이터 준비 완료!")
+        preview_xl = pd.ExcelFile(io.BytesIO(xls_bytes))
+        default_sheet = sheet_input or preview_xl.sheet_names[0]
+        st.session_state["active_sheet"] = default_sheet
+        preview_df = preview_xl.parse(default_sheet).fillna("")
+        st.write(f"**시트:** {default_sheet} / **행:** {len(preview_df)} / **열:** {len(preview_df.columns)}")
+        st.dataframe(preview_df.head(8))
     except Exception as e:
-        st.error(f"임베딩 준비 실패: {e}")
+        st.error(f"엑셀 미리보기 실패: {e}")
+        st.stop()
+
+    # 컬럼 매핑
+    st.subheader("🧩 컬럼 매핑")
+    cols = preview_df.columns.tolist()
+    if not st.session_state["context_cols"] and not st.session_state["answer_col"]:
+        g_ctx, g_ans = guess_columns(preview_df)
+        st.session_state["context_cols"] = g_ctx
+        st.session_state["answer_col"] = g_ans
+
+    sel_ctx = st.multiselect("컨텍스트로 합칠 열들", cols, default=[c for c in st.session_state["context_cols"] if c in cols])
+    sel_ans = st.selectbox("표준응답(정답) 열", ["<선택 안 함>"] + cols,
+                        index=(0 if (st.session_state["answer_col"] not in cols) else (cols.index(st.session_state["answer_col"]) + 1)))
+    st.caption("표준응답 열을 지정하면 평가/코치 품질이 크게 향상됩니다.")
+
+    if st.button("이 매핑으로 임베딩 캐시 생성/로드"):
+        try:
+            df_embed = build_or_load_embeddings_from_excel(
+                xls_bytes=xls_bytes,
+                sheet_name=(sheet_input or None),
+                context_cols=sel_ctx if sel_ctx else cols[:3],
+                answer_col=(None if sel_ans == "<선택 안 함>" else sel_ans),
+                embed_model_name=EMBED_MODEL
+            )
+            st.session_state["excel_df"] = df_embed
+            st.session_state["context_cols"] = sel_ctx if sel_ctx else cols[:3]
+            st.session_state["answer_col"] = (None if sel_ans == "<선택 안 함>" else sel_ans)
+            st.session_state["active_sheet"] = default_sheet
+            st.success("임베딩 데이터 준비 완료!")
+        except Exception as e:
+            st.error(f"임베딩 준비 실패: {e}")
 
 df_embed = st.session_state["excel_df"]
 if df_embed is None:
     st.info("먼저 **임베딩 캐시 생성/로드**를 완료하세요.")
     st.stop()
 
+# 카탈로그 만들기 (자동 제시용)
+if uploaded is None or 'preview_df' not in locals():
+    # 임베딩 DF에서 추출
+    st.session_state["catalog"] = build_catalog_from_embed(df_embed)
+else:
+    st.session_state["catalog"] = build_catalog_from_preview(preview_df, st.session_state["answer_col"])
+
+catalog = st.session_state["catalog"]
+
 st.divider()
+st.title("🩺 간호사 교육용 챗봇 (Excel RAG + Coach)")
+
+# =========================
+# 공통: 케이스 자동 제시(없으면 랜덤)
+# =========================
+def ensure_case_selected():
+    if st.session_state["last_topk"] is None:
+        if catalog is not None and not catalog.empty:
+            pick_row = int(catalog.sample(1)["row_index"].iloc[0])
+            sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
+            st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, pick_row)
+            st.info(f"자동 제시된 케이스: {catalog[catalog['row_index']==pick_row]['case_title'].iloc[0]}")
+
+def show_case_header(top1: pd.Series):
+    st.markdown("### 📄 케이스 요약")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**컨텍스트**")
+        st.write(top1["context"])
+    with c2:
+        st.markdown("**표준응답**")
+        st.write(top1["answer"])
 
 # =========================
 # 모드별 UI
@@ -418,99 +561,103 @@ if mode == "질문(학습)":
             st.dataframe(st.session_state["last_topk"][["sheet","row_index","similarity","context","answer"]])
 
 elif mode == "퀴즈(평가)":
-    st.caption("데이터에서 상위 유사 항목 1개를 기준으로 사용자의 답변을 평가합니다.")
-    with st.form("quiz_form", clear_on_submit=False):
-        case_query = st.text_input("케이스 키워드(예: 낙상 예방, 환자확인 등)", "")
-        user_answer = st.text_area("훈련생 답변", height=180)
-        btn_find = st.form_submit_button("케이스 찾기")
-        btn_eval = st.form_submit_button("평가 요청")
-    if btn_find and case_query.strip():
-        topk = search_top_k(df_embed, case_query.strip(), k=1)
-        st.session_state["last_topk"] = topk
-        st.success("케이스를 찾았습니다. 아래에서 컨텍스트/표준응답을 확인하세요.")
-    if btn_eval:
-        if st.session_state["last_topk"] is None or len(st.session_state["last_topk"]) == 0:
-            st.warning("먼저 '케이스 찾기'로 평가 기준을 선택하세요.")
-        elif not user_answer.strip():
-            st.warning("훈련생 답변을 입력하세요.")
-        else:
-            top1 = st.session_state["last_topk"].iloc[0]
-            msgs = make_messages_for_quiz(top1, user_answer.strip(), workplace, forb_prompt)
+    # 자동 제시
+    ensure_case_selected()
+    # 카탈로그 그리드 (원클릭 선택)
+    chosen = render_case_shelf(catalog, label="다른 케이스 선택", max_items=9)
+    if chosen is not None:
+        sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
+        st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
+
+    if st.session_state["last_topk"] is not None and len(st.session_state["last_topk"])>0:
+        top1 = st.session_state["last_topk"].iloc[0]
+        show_case_header(top1)
+
+        st.caption("케이스 기준으로 훈련생 답변을 평가합니다.")
+        with st.form("quiz_form", clear_on_submit=False):
+            user_answer = st.text_area("훈련생 답변", height=180)
+            btn_eval = st.form_submit_button("평가 요청")
+        if btn_eval:
+            msgs = make_messages_for_quiz(top1, (user_answer or "").strip(), workplace, forb_prompt)
             feedback = call_llm(msgs)
             st.markdown("### 🧪 평가 결과")
             st.write(feedback)
-    with st.expander("📄 현재 선택된 케이스(Top-1)"):
-        if st.session_state["last_topk"] is not None and len(st.session_state["last_topk"]) > 0:
-            top1 = st.session_state["last_topk"].iloc[0]
-            st.write(f"**sheet:** {top1['sheet']} / **row:** {top1['row_index']} / **sim:** {top1['similarity']:.4f}")
-            st.markdown("**컨텍스트**"); st.write(top1["context"])
-            st.markdown("**표준응답**"); st.write(top1["answer"])
+    else:
+        st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
 
 else:  # 코치(지도)
-    st.caption("훈련생의 초안 문장을 코칭하여 더 예의 바르고 안전한 문장으로 개선합니다.")
-    with st.form("coach_form", clear_on_submit=False):
-        case_query = st.text_input("케이스 키워드(예: 환자확인, 낙상 예방, 투약 전 확인 등)", "")
-        user_answer = st.text_area("훈련생 초안(현재 말하려는 문장)", height=160)
-        tone = st.selectbox("코칭 톤", ["따뜻하고 정중하게","간결하고 단호하게","차분하고 공감 있게"], index=0)
-        btn_find = st.form_submit_button("케이스 찾기")
-        btn_coach = st.form_submit_button("코칭 받기")
-    if btn_find and case_query.strip():
-        topk = search_top_k(df_embed, case_query.strip(), k=1)
-        st.session_state["last_topk"] = topk
-        st.success("케이스를 찾았습니다. 아래에서 컨텍스트/표준응답을 확인하세요.")
-    if btn_coach:
-        if st.session_state["last_topk"] is None or len(st.session_state["last_topk"]) == 0:
-            st.warning("먼저 '케이스 찾기'로 코칭 기준을 선택하세요.")
-        elif not user_answer.strip():
-            st.warning("훈련생 초안을 입력하세요.")
-        else:
-            top1 = st.session_state["last_topk"].iloc[0]
-            msgs = make_messages_for_coach(top1, user_answer.strip(), workplace, tone, forb_prompt)
+    # 자동 제시
+    ensure_case_selected()
+    # 카탈로그 그리드 (원클릭 선택)
+    chosen = render_case_shelf(catalog, label="다른 케이스 선택", max_items=9)
+    if chosen is not None:
+        sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
+        st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
+
+    # 초안 상태 보관
+    if "draft_text" not in st.session_state:
+        st.session_state["draft_text"] = ""
+
+    if st.session_state["last_topk"] is not None and len(st.session_state["last_topk"])>0:
+        top1 = st.session_state["last_topk"].iloc[0]
+        show_case_header(top1)
+
+        st.caption("훈련생의 초안 문장을 코칭하여 더 예의 바르고 안전한 문장으로 개선합니다.")
+        with st.form("coach_form", clear_on_submit=False):
+            tone = st.selectbox("코칭 톤", ["따뜻하고 정중하게","간결하고 단호하게","차분하고 공감 있게"], index=0)
+            user_answer = st.text_area("훈련생 초안(현재 말하려는 문장)", value=st.session_state["draft_text"], height=140, key="draft_area")
+            colA, colB = st.columns(2)
+            with colA:
+                auto_draft = st.form_submit_button("초안 자동 제시")
+            with colB:
+                btn_coach = st.form_submit_button("코칭 받기")
+
+        if auto_draft:
+            # 표준응답을 바탕으로 짧은 정중 스크립트 제안
+            msgs_draft = [
+                {"role":"system","content":f"간호사 커뮤니케이션 코치입니다. 근무지: {workplace}. 표준응답을 참고해 한국어로 1~2문장 정중한 안내 스크립트를 만들어 주세요."},
+                {"role":"user","content": f"[표준응답]\n{top1['answer']}\n\n출력: 공손하고 명확한 1~2문장"}
+            ]
+            draft_text = call_llm(msgs_draft, max_output_tokens=200, temperature=0.2)
+            st.session_state["draft_text"] = draft_text
+            st.experimental_rerun()
+
+        if btn_coach:
+            msgs = make_messages_for_coach(top1, (st.session_state["draft_text"] or "").strip() or (user_answer or "").strip(), workplace, tone, forb_prompt)
             coaching = call_llm(msgs, max_output_tokens=1200, temperature=0.25)
             st.session_state["coaching_text"] = coaching
             st.markdown("### 🧑‍🏫 코칭 결과")
             st.write(coaching)
 
-            # --- TTS: 모범/대안 스크립트 추출 & 재생 ---
+            # --- TTS 버튼들 ---
             scripts = extract_scripts_from_coaching(coaching)
-            colA, colB, colC = st.columns(3)
-            with colA:
+            col1, col2, col3 = st.columns(3)
+            with col1:
                 if scripts.get("baseline"):
                     if st.button("▶️ 모범 답안 듣기"):
                         mp3 = synthesize_tts(scripts["baseline"])
                         if mp3: st.audio(mp3)
-            with colB:
+            with col2:
                 if scripts.get("variants"):
                     if st.button("▶️ 대안 스크립트 듣기"):
                         mp3 = synthesize_tts(scripts["variants"])
                         if mp3: st.audio(mp3)
-            with colC:
+            with col3:
                 custom_say = st.text_input("원하는 문장 직접 듣기(선택)", value="")
                 if st.button("▶️ 위 문장 듣기") and custom_say.strip():
                     mp3 = synthesize_tts(custom_say.strip())
                     if mp3: st.audio(mp3)
 
-    # 다회 코칭 루프
-    if st.session_state["coaching_text"]:
-        st.divider()
-        st.markdown("### ✍️ 다시 써보기 → 재코칭")
-        revised = st.text_area("수정안(코칭을 반영해 다시 작성)", height=140, key="revised_text")
-        if st.button("다시 코칭"):
-            if st.session_state["last_topk"] is None or len(st.session_state["last_topk"]) == 0:
-                st.warning("먼저 케이스를 선택하세요.")
-            elif not revised.strip():
-                st.warning("수정안을 입력하세요.")
-            else:
-                top1 = st.session_state["last_topk"].iloc[0]
-                msgs2 = make_messages_for_coach(top1, revised.strip(), workplace, tone, forb_prompt)
+        # 재코칭 루프
+        if st.session_state["coaching_text"]:
+            st.divider()
+            st.markdown("### ✍️ 다시 써보기 → 재코칭")
+            revised = st.text_area("수정안(코칭을 반영해 다시 작성)", height=140, key="revised_text")
+            if st.button("다시 코칭"):
+                msgs2 = make_messages_for_coach(top1, (revised or "").strip(), workplace, tone, forb_prompt)
                 coaching2 = call_llm(msgs2, max_output_tokens=1200, temperature=0.25)
                 st.session_state["coaching_text"] = coaching2
                 st.markdown("### 🧑‍🏫 재코칭 결과")
                 st.write(coaching2)
-
-    with st.expander("📄 현재 선택된 케이스(Top-1)"):
-        if st.session_state["last_topk"] is not None and len(st.session_state["last_topk"]) > 0:
-            top1 = st.session_state["last_topk"].iloc[0]
-            st.write(f"**sheet:** {top1['sheet']} / **row:** {top1['row_index']} / **sim:** {top1['similarity']:.4f}")
-            st.markdown("**컨텍스트**"); st.write(top1["context"])
-            st.markdown("**표준응답**"); st.write(top1["answer"])
+    else:
+        st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
