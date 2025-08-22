@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/embed__*.csv
+*.mp3
+.DS_Store
+Thumbs.db
