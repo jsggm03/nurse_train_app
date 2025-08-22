@@ -40,6 +40,7 @@ def _init_state():
     defaults = {
         "excel_df": None,
         "last_topk": None,
+        "last_topk_source": "",
         "context_cols": [],
         "answer_col": None,
         "catalog": None,
@@ -156,11 +157,9 @@ def get_embedding(text: str) -> List[float]:
 # =========================
 def guess_columns(df: pd.DataFrame) -> Tuple[List[str], Optional[str]]:
     cols = df.columns.tolist()
-    # 정답 후보
     answer_candidates = [c for c in cols if any(k in str(c) for k in ANSWER_TOKENS)]
     answer_col = answer_candidates[0] if answer_candidates else (cols[0] if cols else None)
 
-    # 컨텍스트 후보
     context_cols = []
     for c in cols:
         if c == answer_col: 
@@ -224,7 +223,6 @@ def build_or_load_embeddings_from_excel(
     embed_model_name: str
 ) -> pd.DataFrame:
     file_md5 = md5_of_bytes(xls_bytes)
-    # answer_col은 컨텍스트에서 제외
     context_cols = [c for c in context_cols if c != answer_col and not any(k in str(c) for k in ANSWER_TOKENS)]
     columns_sig = json.dumps({"context": context_cols, "answer": answer_col}, ensure_ascii=False, sort_keys=True)
     cache_name = f"embed__{embed_model_name}__{file_md5}__{(sheet_name or 'all') }__{md5_of_bytes(columns_sig.encode())}.csv"
@@ -237,7 +235,6 @@ def build_or_load_embeddings_from_excel(
         return df
 
     xl = pd.ExcelFile(io.BytesIO(xls_bytes))
-    # sheet_input이 비어 있으면 모든 시트를 임베딩 (병동별 시트 자동 분류)
     sheets = [sheet_name] if (sheet_name and sheet_name in xl.sheet_names) else xl.sheet_names
 
     rows = []
@@ -254,7 +251,7 @@ def build_or_load_embeddings_from_excel(
                 "row_index": ridx,
                 "context": context,
                 "answer": answer,
-                "ward": ward_from_this_sheet,     # ✅ 캐시에 저장
+                "ward": ward_from_this_sheet,
                 "embedding": emb
             })
             if (ridx % 20) == 19: time.sleep(0.03)
@@ -642,13 +639,20 @@ if mode == "질문(학습)":
     if send and q.strip():
         topk = search_top_k(df_embed, q.strip(), k=3)
         st.session_state["last_topk"] = topk
+        st.session_state["last_topk_source"] = "ask"  # ← 검색에서 온 것 표시(선택적)
         msgs = make_messages_for_answer(topk, q.strip(), workplace, forb_prompt)
         ans = call_llm(msgs)
         message(q.strip(), is_user=True, key="ask_u_"+str(time.time()))
         message(ans, key="ask_b_"+str(time.time()))
+    # 안전한 Top-K 표 (존재하는 컬럼만)
     with st.expander("🔎 사용된 자료(Top-K)"):
-        if st.session_state["last_topk"] is not None:
-            st.dataframe(st.session_state["last_topk"][["sheet","row_index","similarity","context","answer"]], use_container_width=True)
+        lt = st.session_state.get("last_topk")
+        if isinstance(lt, pd.DataFrame) and not lt.empty:
+            want = ["sheet", "row_index", "similarity", "context", "answer"]
+            cols_show = [c for c in want if c in lt.columns]
+            st.dataframe(lt[cols_show], use_container_width=True)
+        else:
+            st.caption("아직 검색 결과가 없습니다.")
 
 elif mode == "퀴즈(평가)":
     ward_options = ["전체"] + unique_wards
@@ -675,6 +679,7 @@ elif mode == "퀴즈(평가)":
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
         st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
+        st.session_state["last_topk_source"] = "quiz_select"
         reset_reveal_flags()
 
     if st.session_state["last_topk"] is not None and len(st.session_state["last_topk"])>0:
@@ -720,6 +725,7 @@ else:  # 코치(지도)
     if chosen is not None:
         sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
         st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
+        st.session_state["last_topk_source"] = "coach_select"
         reset_reveal_flags()
 
     if st.session_state["last_topk"] is not None and len(st.session_state["last_topk"])>0:
@@ -769,4 +775,3 @@ else:  # 코치(지도)
                 st.markdown("### 🧑‍🏫 재코칭 결과"); st.write(coaching2)
     else:
         st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
-
