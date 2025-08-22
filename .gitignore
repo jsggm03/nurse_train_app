@@ -1,6 +1,28 @@
+# Python
 __pycache__/
-*.pyc
-data/embed__*.csv
-*.mp3
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+
+# OS
 .DS_Store
 Thumbs.db
+
+# Streamlit (로컬 시크릿만; Cloud에선 UI로 입력)
+.streamlit/secrets.toml
+
+# Data caches & artifacts
+data/embed__*.csv
+data/*.mp3
+*.mp3
+
+# Logs
+logs/
+
+# Jupyter/VSCode etc (선택)
+.ipynb_checkpoints/
+.vscode/
