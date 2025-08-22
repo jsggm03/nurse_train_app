@@ -1,11 +1,6 @@
-# Streamlit 앱 & 채팅 UI
-streamlit>=1.37
-streamlit-chat==0.0.2.2
-
-# OpenAI SDK (Responses API, Embeddings, TTS)
-openai>=1.40
-
-# 데이터 처리 / 엑셀
-pandas>=2.2
-numpy>=1.26
-openpyxl>=3.1
+openai>=1.42.0,<2.0
+streamlit>=1.36.0
+streamlit-chat>=0.0.2.2
+pandas>=2.0.3
+numpy>=1.24.0
+openpyxl>=3.1.2
