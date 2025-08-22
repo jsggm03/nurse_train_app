@@ -29,7 +29,7 @@ DEFAULT_EMBED = "text-embedding-3-large"
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ▶ 기본 엑셀 경로(루트/ assets/ 모두 지원)
+# 기본 엑셀 경로(루트/ assets/ 지원)
 BASE_DIR = Path(__file__).resolve().parent
 XLS_CANDIDATES = [
     BASE_DIR / "간호사교육_질의응답자료_근무지별.xlsx",
@@ -57,7 +57,7 @@ def _load_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
 
-# --- 정답(표준/모범/정답/answer/response) 키워드 ---
+# --- 정답 키워드 & 컨텍스트 보호 ---
 ANSWER_TOKENS = ["표준", "모범", "정답", "answer", "response"]
 
 def strip_answer_from_context(text: str) -> str:
@@ -66,28 +66,43 @@ def strip_answer_from_context(text: str) -> str:
     pat = r"\[(?:[^]]*(?:%s)[^]]*)\]\s*[^|]*\s*(?:\|\s*)?" % "|".join(map(re.escape, ANSWER_TOKENS))
     return re.sub(pat, "", text, flags=re.IGNORECASE)
 
-# --- 근무지 정규화(표기 통일) & 시트명→근무지 매핑 ---
+# --- 근무지 정규화 & 시트명→근무지 ---
 WARD_CANON = ["병동분만실", "외래", "응급실", "수술실", "신생아부서"]
 
-def _flat(s: str) -> str:
-    return re.sub(r"\s+", "", (s or "").lower())
+def _flat(s: object) -> str:
+    """비문자/NaN도 안전하게 소문자+공백제거 문자열로 변환"""
+    if s is None:
+        return ""
+    try:
+        s = str(s)
+    except Exception:
+        s = ""
+    s = s.strip()
+    if s.lower() in ("nan", "none", ""):
+        return ""
+    return re.sub(r"\s+", "", s.lower())
 
-def normalize_ward(s: str) -> str:
+def normalize_ward(s: object) -> str:
     f = _flat(s)
-    if any(k in f for k in ["분만", "병동"]): return "병동분만실"
-    if "외래" in f: return "외래"
-    if "응급" in f or f == "er": return "응급실"
-    if "수술" in f or f == "or": return "수술실"
-    if any(k in f for k in ["신생아", "nicu", "소아"]): return "신생아부서"
-    return (s or "").strip() or "공통"
+    if not f:
+        return "공통"
+    if "분만" in f or "병동" in f:
+        return "병동분만실"
+    if "외래" in f:
+        return "외래"
+    if "응급" in f or f == "er":
+        return "응급실"
+    if "수술" in f or f == "or":
+        return "수술실"
+    if "신생아" in f or "nicu" in f or "소아" in f:
+        return "신생아부서"
+    return s.strip() if isinstance(s, str) and s.strip() else "공통"
 
 def ward_from_sheet(sheet_name: str) -> str:
-    """시트 이름에서 근무지 추론 (엑셀 행에 근무지 정보가 없을 때 사용)"""
+    """시트 이름에서 근무지 추론"""
     return normalize_ward(sheet_name)
 
-# =========================
 # 정답 공개 상태 리셋
-# =========================
 def reset_reveal_flags():
     st.session_state["revealed_quiz"] = False
     st.session_state["revealed_coach"] = False
@@ -118,7 +133,7 @@ def get_embedding(text: str) -> List[float]:
 # =========================
 def guess_columns(df: pd.DataFrame) -> Tuple[List[str], Optional[str]]:
     cols = df.columns.tolist()
-    # 정답 후보 먼저 찾기
+    # 정답 후보
     answer_candidates = [c for c in cols if any(k in str(c) for k in ANSWER_TOKENS)]
     answer_col = answer_candidates[0] if answer_candidates else (cols[0] if cols else None)
 
@@ -204,12 +219,11 @@ def build_or_load_embeddings_from_excel(
 
     rows = []
     for sh in sheets:
-        ward_from_this_sheet = ward_from_sheet(sh)
+        ward_from_this_sheet = ward_from_sheet(sh)  # ▶ 시트명 기반 분류
         tdf = xl.parse(sh).fillna("")
         for ridx, row in tdf.iterrows():
             built = build_context_row(row, context_cols, answer_col)
             context, answer = built["context"], built["answer"]
-            # 컨텍스트에 혹시 또 정답 흔적이 있으면 제거
             context = strip_answer_from_context(context)
             emb = get_embedding(context)
             rows.append({
@@ -217,7 +231,7 @@ def build_or_load_embeddings_from_excel(
                 "row_index": ridx,
                 "context": context,
                 "answer": answer,
-                "ward": ward_from_this_sheet,     # ▶ 시트명 기반 분류
+                "ward": ward_from_this_sheet,     # ✅ 캐시에 저장
                 "embedding": emb
             })
             if (ridx % 20) == 19: time.sleep(0.05)
@@ -374,7 +388,7 @@ def make_messages_for_quiz(top1: pd.Series, user_answer: str, workplace: str, fo
 [훈련생 답변]
 {user_answer}
 
-[표준응답(참고용)]
+[표준응답(근거)]
 {top1['answer']}
 
 요구사항:
@@ -549,8 +563,12 @@ df_embed = st.session_state["excel_df"]
 if df_embed is None:
     st.info("먼저 **임베딩 캐시 생성/로드**를 완료하세요."); st.stop()
 
-# --- 시트기반 분류 적용: ward_norm 생성
-df_embed["ward_norm"] = df_embed["ward"].apply(normalize_ward) if "ward" in df_embed.columns else "공통"
+# --- ward_norm 생성: ward 없으면 시트명으로 추론, 모두 안전 처리
+if "ward" in df_embed.columns:
+    ward_source = df_embed["ward"]
+else:
+    ward_source = df_embed["sheet"].map(ward_from_sheet)
+df_embed["ward_norm"] = ward_source.map(normalize_ward)
 
 # 카탈로그
 if uploaded is None or 'preview_df' not in locals():
@@ -608,7 +626,7 @@ def show_case_header(top1: pd.Series, reveal_answer: bool):
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**컨텍스트**")
-        st.write(top1["context"])  # ← 컨텍스트에는 정답이 제거되어 있음
+        st.write(top1["context"])  # 컨텍스트는 정답 제거됨
     with c2:
         st.markdown("**표준응답**")
         if reveal_answer:
