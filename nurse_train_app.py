@@ -56,7 +56,7 @@ def _load_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
 
-# --- 근무지 표준화 ---
+# --- 근무지 표준화/정리 ---
 WARD_ORDER = ["병동분만실", "외래", "응급실", "수술실", "신생아부서"]
 WARD_MAP = {
     "일반병동": "병동분만실", "병동": "병동분만실", "분만실": "병동분만실",
@@ -107,6 +107,20 @@ def strip_answer_from_context(ctx: str, ans: str = "") -> str:
 def reset_reveal_flags():
     st.session_state["revealed_quiz"] = False
     st.session_state["revealed_coach"] = False
+
+# 🔄 임베딩 상태/캐시 무시하고 재매핑 플로우로 진입
+def _reset_embed_state():
+    st.session_state["force_remap"] = True
+    for k in [
+        "excel_df","catalog","last_topk","context_cols","answer_col","ward_col",
+        "active_sheet","case_order","case_pos","filter_sig",
+        "revealed_quiz","revealed_coach","draft_text","coaching_text"
+    ]:
+        if k in st.session_state: del st.session_state[k]
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 # =========================
 # 임베딩
@@ -207,7 +221,6 @@ def build_or_load_embeddings_from_excel(
         st.info(f"📦 캐시 로드: {os.path.basename(cache_path)}")
         df = pd.read_csv(cache_path)
         df["embedding"] = df["embedding"].apply(safe_parse_embedding)
-        # 과거 캐시에 ward가 없을 수 있음 → 보강
         if "ward_norm" not in df.columns:
             df["ward"] = df.get("ward", "")
             df["ward"] = df["ward"].apply(clean_ward)
@@ -286,23 +299,6 @@ def enrich_ward_from_excel_if_missing(df_embed: pd.DataFrame, xls_bytes: bytes, 
 # 케이스 카탈로그
 # =========================
 TITLE_KEYS = ["평가항목","항목","주제","케이스","질문","제목","카테고리"]
-
-def build_catalog_from_preview(df: pd.DataFrame, answer_col: Optional[str]) -> pd.DataFrame:
-    title_col = next((c for c in TITLE_KEYS if c in df.columns), None)
-    titles, rows, seen = [], [], set()
-    for ridx, row in df.iterrows():
-        if title_col and str(row.get(title_col,"")).strip():
-            t = str(row[title_col]).strip()
-        else:
-            base = str(row.get(answer_col,"") or "")[:30] if answer_col else ""
-            if not base:
-                for c in df.columns:
-                    s = str(row.get(c,"") or "").strip()
-                    if s: base = s[:30]; break
-            t = base or f"Row {ridx}"
-        if t in seen: continue
-        seen.add(t); titles.append(t); rows.append(ridx)
-    return pd.DataFrame({"case_title": titles, "row_index": rows})
 
 def build_catalog_from_embed(df_embed: pd.DataFrame) -> pd.DataFrame:
     titles, rows, seen = [], [], set()
@@ -476,6 +472,9 @@ with st.sidebar:
     st.divider()
     uploaded = st.file_uploader("엑셀 업로드 (.xlsx) — 업로드 없으면 기본 파일 자동 사용", type=["xlsx"])
     sheet_input = st.text_input("사용할 시트명(비우면 첫 시트)", value="")
+    if st.button("🔄 임베딩 캐시 무시하고 재매핑"):
+        _reset_embed_state()
+        st.experimental_rerun()
     use_forbidden = st.toggle("금기 표현 시트(금기표현) 사용", value=True)
 
 # =========================
@@ -486,7 +485,8 @@ defaults = {
     "ward_col": None,
     "coaching_text": "", "catalog": None, "active_sheet": None,
     "revealed_quiz": False, "revealed_coach": False,
-    "draft_text": "", "case_order": [], "case_pos": -1, "filter_sig": ""
+    "draft_text": "", "case_order": [], "case_pos": -1, "filter_sig": "",
+    "force_remap": False
 }
 for k, v in defaults.items():
     if k not in st.session_state: st.session_state[k] = v
@@ -509,10 +509,10 @@ forbidden_df = load_forbidden_sheet(xls_bytes) if use_forbidden else pd.DataFram
 forb_prompt = forbidden_as_prompt(forbidden_df)
 
 # =========================
-# 캐시 우선
+# 캐시 우선 (force_remap 이면 건너뜀)
 # =========================
 precomputed = pick_precomputed_cache(EMBED_MODEL)
-if uploaded is None and st.session_state["excel_df"] is None and precomputed:
+if (not st.session_state.get("force_remap")) and uploaded is None and st.session_state["excel_df"] is None and precomputed:
     st.session_state["excel_df"] = load_precomputed_embeddings(precomputed)
     st.success(f"📦 사전 계산 임베딩 사용: {os.path.basename(precomputed)}")
 
@@ -562,6 +562,7 @@ if st.session_state["excel_df"] is None:
             st.session_state["answer_col"] = (None if sel_ans == "<선택 안 함>" else sel_ans)
             st.session_state["ward_col"] = (None if sel_ward == "<선택 안 함>" else sel_ward)
             st.session_state["active_sheet"] = default_sheet
+            st.session_state["force_remap"] = False
             st.success("임베딩 데이터 준비 완료!")
         except Exception as e:
             st.error(f"임베딩 준비 실패: {e}")
@@ -591,6 +592,14 @@ st.session_state["catalog"] = catalog
 
 st.divider()
 st.title("🩺 간호사 교육용 챗봇 (Excel RAG + Coach)")
+
+# (선택) 근무지 분포 확인
+with st.expander("🔧 근무지(병동) 분포 확인"):
+    if "ward_norm" in df_embed.columns:
+        st.dataframe(
+            df_embed["ward_norm"].fillna("").replace("", "〈빈값〉")
+            .value_counts().rename_axis("근무지").reset_index(name="문항수")
+        )
 
 # =========================
 # 공통: 출제/필터
@@ -666,7 +675,6 @@ if mode == "질문(학습)":
             st.dataframe(st.session_state["last_topk"][["sheet","row_index","similarity","context","answer"]])
 
 elif mode == "퀴즈(평가)":
-    # 드롭다운은 5개 부서 고정 노출
     ward_options = ["전체"] + WARD_ORDER
 
     opt_col1, opt_col2, opt_col3 = st.columns([2,1,1])
