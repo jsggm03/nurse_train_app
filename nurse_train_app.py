@@ -300,7 +300,7 @@ def make_messages_for_answer(topk: pd.DataFrame, user_query: str, workplace: str
         docs.append(
             f"[doc {i+1}] sheet={r['sheet']} | row={r['row_index']} | sim={r.get('similarity',1.0):.4f}\n"
             f"컨텍스트: {trim(r['context'])}\n"
-            f"표준응답: {trim(r['answer']})"
+            f"표준응답: {trim(r['answer'])}"
         )
     joined = "\n\n".join(docs)
     system = (
@@ -774,3 +774,4 @@ else:  # 코치(지도)
                 st.write(coaching2)
     else:
         st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
+
