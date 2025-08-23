@@ -623,11 +623,21 @@ def get_filtered_catalog(_catalog: pd.DataFrame, ward_choice: str) -> pd.DataFra
     return _catalog
 
 def rebuild_order_if_needed(filtered: pd.DataFrame, shuffle: bool, ward_choice: str, mode_tag: str):
+    # 필터/모드가 바뀌었을 때만 순서 새로 구성
     sig = json.dumps({"ward": ward_choice, "shuffle": shuffle, "mode": mode_tag})
     if st.session_state["filter_sig"] != sig:
         st.session_state["filter_sig"] = sig
-        order = [(r["sheet"], int(r["row_index"])) for _, r in (filtered or pd.DataFrame()).iterrows()]
-        if shuffle: random.shuffle(order)
+
+        # ✅ DataFrame을 불리언 평가로 쓰면 ValueError 발생 → 안전 처리
+        if filtered is None or len(filtered) == 0:
+            df_iter = pd.DataFrame(columns=["sheet", "row_index"])
+        else:
+            df_iter = filtered
+
+        order = [(r["sheet"], int(r["row_index"])) for _, r in df_iter.iterrows()]
+        if shuffle:
+            random.shuffle(order)
+
         st.session_state["case_order"] = order
         st.session_state["case_pos"] = -1
         st.session_state["last_topk"] = None
@@ -812,3 +822,4 @@ else:  # 코치(지도)
                 st.markdown("### 🧑‍🏫 재코칭 결과"); st.write(coaching2)
     else:
         st.warning("케이스를 선택하거나 임베딩을 준비해 주세요.")
+
