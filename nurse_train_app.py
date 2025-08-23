@@ -35,7 +35,7 @@ XLS_CANDIDATES = [
     BASE_DIR / "assets/간호사교육_질의응답자료_근무지별.xlsx",
 ]
 
-# ---- Session state defaults (항상 최우선으로 실행) ----
+# ---- Session state defaults ----
 def _init_state():
     defaults = {
         "excel_df": None,
@@ -49,7 +49,7 @@ def _init_state():
         "revealed_coach": False,
         "draft_text": "",
         "filter_sig": "",
-        "case_order": [],
+        "case_order": [],            # [(sheet,row_index), ...]
         "case_pos": -1,
         "coaching_text": "",
         "ward_quiz": "전체",
@@ -283,37 +283,38 @@ def pick_precomputed_cache(embed_model: str) -> Optional[str]:
     return candidates[0]
 
 # =========================
-# 카탈로그(자동 제시)
+# 카탈로그(시트/행 포함)
 # =========================
 TITLE_KEYS = ["평가항목","항목","주제","케이스","질문","제목","카테고리"]
 
 def build_catalog_from_embed(df_embed: pd.DataFrame) -> pd.DataFrame:
-    titles, rows, seen = [], [], set()
+    titles, sheets, rows, wards = [], [], [], []
     for _, r in df_embed.iterrows():
-        text = r["context"]
+        text = r.get("context", "") or ""
         m = re.search(r"\[(평가항목|항목|주제|케이스|질문|제목|카테고리)\]\s*([^|\n]+)", text)
         if m:
             title = m.group(2).strip()[:40]
         else:
             ans = (r.get("answer") or "")[:40]
-            title = ans or (text[:40] if text else f"Row {r['row_index']}")
-        if title in seen:
-            continue
-        seen.add(title)
-        titles.append(title); rows.append(int(r["row_index"]))
-    return pd.DataFrame({"case_title": titles, "row_index": rows})
+            title = ans or (text[:40] if text else f"Row {int(r['row_index'])}")
+        titles.append(title)
+        sheets.append(str(r["sheet"]))
+        rows.append(int(r["row_index"]))
+        wards.append(r.get("ward_norm", r.get("ward", "공통")))
+    df = pd.DataFrame({"case_title": titles, "sheet": sheets, "row_index": rows, "ward_norm": wards})
+    return df.drop_duplicates(subset=["sheet", "row_index"]).reset_index(drop=True)
 
-def render_case_shelf(catalog: pd.DataFrame, label="추천 케이스", max_items: int = 18) -> Optional[int]:
+def render_case_shelf(catalog: pd.DataFrame, label="추천 케이스", max_items: int = 18):
     if catalog is None or catalog.empty:
         return None
     st.markdown(f"#### 📚 {label}")
     show = catalog.head(max_items).reset_index(drop=True)
     cols = st.columns(3)
-    chosen: Optional[int] = None
+    chosen = None
     for i, row in show.iterrows():
         with cols[i % 3]:
-            if st.button("🔹 " + str(row["case_title"]), key=f"case_{label}_{i}"):
-                chosen = int(row["row_index"])
+            if st.button("🔹 " + str(row["case_title"]), key=f"case_{label}_{i}_{row['sheet']}_{row['row_index']}"):
+                chosen = (row["sheet"], int(row["row_index"]))
     with st.expander("전체 목록 보기"):
         st.dataframe(catalog, use_container_width=True)
     return chosen
@@ -575,7 +576,6 @@ try:
         st.warning(f"임베딩에 포함된 시트({len(set(embed_sheets))}): {', '.join(embed_sheets)} / "
                    f"엑셀 시트({len(all_sheets)}): {', '.join(all_sheets)}")
         if st.button("🔁 전체 시트로 다시 임베딩"):
-            # 기본 컨텍스트/정답 열 재구성 후 전체 시트 임베딩
             first_df = xl_for_check.parse(all_sheets[0]).fillna("")
             if st.session_state.get("context_cols"):
                 ctx_cols = [c for c in st.session_state["context_cols"] if c in first_df.columns]
@@ -605,27 +605,28 @@ if st.session_state.get("preset_to_filter"):
         st.session_state["ward_quiz"] = p
         st.session_state["ward_coach"] = p
 
-# 카탈로그
+# 카탈로그 (시트/행 포함)
 st.session_state["catalog"] = build_catalog_from_embed(df_embed)
 catalog = st.session_state["catalog"]
 
 st.title("🩺 간호사 교육용 챗봇 (Excel RAG + Coach)")
-st.caption(f"사용 가능한 병동 분류: {', '.join(unique_wards) if unique_wards else '없음(시트명 확인 필요)'}")
+st.caption(f"사용 가능한 병동 분류: {', '.join(unique_wards) if unique_wards else '없음(시트명/근무지 확인 필요)'}")
 
 # =========================
 # 공통 출제/필터
 # =========================
 def get_filtered_catalog(_catalog: pd.DataFrame, ward_choice: str) -> pd.DataFrame:
-    if (_catalog is not None) and (not _catalog.empty) and ward_choice and ward_choice != "전체":
-        idxs = set(df_embed.loc[df_embed["ward_norm"] == ward_choice, "row_index"].astype(int).tolist())
-        return _catalog[_catalog["row_index"].isin(list(idxs))].reset_index(drop=True)
+    if _catalog is None or _catalog.empty:
+        return _catalog
+    if ward_choice and ward_choice != "전체":
+        return _catalog[_catalog["ward_norm"] == ward_choice].reset_index(drop=True)
     return _catalog
 
 def rebuild_order_if_needed(filtered: pd.DataFrame, shuffle: bool, ward_choice: str, mode_tag: str):
     sig = json.dumps({"ward": ward_choice, "shuffle": shuffle, "mode": mode_tag})
     if st.session_state["filter_sig"] != sig:
         st.session_state["filter_sig"] = sig
-        order = filtered["row_index"].astype(int).tolist() if filtered is not None else []
+        order = [(r["sheet"], int(r["row_index"])) for _, r in (filtered or pd.DataFrame()).iterrows()]
         if shuffle: random.shuffle(order)
         st.session_state["case_order"] = order
         st.session_state["case_pos"] = -1
@@ -635,18 +636,16 @@ def rebuild_order_if_needed(filtered: pd.DataFrame, shuffle: bool, ward_choice: 
 def next_case(filtered: pd.DataFrame):
     if filtered is None or filtered.empty: return
     if not st.session_state["case_order"]:
-        st.session_state["case_order"] = filtered["row_index"].astype(int).tolist()
+        st.session_state["case_order"] = [(r["sheet"], int(r["row_index"])) for _, r in filtered.iterrows()]
     st.session_state["case_pos"] = (st.session_state["case_pos"] + 1) % len(st.session_state["case_order"])
-    ridx = st.session_state["case_order"][st.session_state["case_pos"]]
-    sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
+    sheet, ridx = st.session_state["case_order"][st.session_state["case_pos"]]
     st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, ridx)
     reset_reveal_flags()
 
 def random_case(filtered: pd.DataFrame):
     if filtered is None or filtered.empty: return
-    ridx = int(filtered.sample(1)["row_index"].iloc[0])
-    sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
-    st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, ridx)
+    r = filtered.sample(1).iloc[0]
+    st.session_state["last_topk"] = select_case_by_row(df_embed, r["sheet"], int(r["row_index"]))
     reset_reveal_flags()
 
 def ensure_case_selected(filtered: pd.DataFrame):
@@ -715,8 +714,8 @@ elif mode == "퀴즈(평가)":
 
     chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=tiles)
     if chosen is not None:
-        sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
-        st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
+        ch_sheet, ch_row = chosen
+        st.session_state["last_topk"] = select_case_by_row(df_embed, ch_sheet, ch_row)
         st.session_state["last_topk_source"] = "quiz_select"
         reset_reveal_flags()
 
@@ -761,8 +760,8 @@ else:  # 코치(지도)
 
     chosen = render_case_shelf(filtered_catalog, label="다른 케이스 선택", max_items=tiles)
     if chosen is not None:
-        sheet = st.session_state.get("active_sheet") or str(df_embed["sheet"].iloc[0])
-        st.session_state["last_topk"] = select_case_by_row(df_embed, sheet, chosen)
+        ch_sheet, ch_row = chosen
+        st.session_state["last_topk"] = select_case_by_row(df_embed, ch_sheet, ch_row)
         st.session_state["last_topk_source"] = "coach_select"
         reset_reveal_flags()
 
