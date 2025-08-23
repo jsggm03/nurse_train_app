@@ -223,19 +223,24 @@ def build_or_load_embeddings_from_excel(
     embed_model_name: str
 ) -> pd.DataFrame:
     file_md5 = md5_of_bytes(xls_bytes)
+    # answer_col은 컨텍스트에서 제외
     context_cols = [c for c in context_cols if c != answer_col and not any(k in str(c) for k in ANSWER_TOKENS)]
     columns_sig = json.dumps({"context": context_cols, "answer": answer_col}, ensure_ascii=False, sort_keys=True)
-    cache_name = f"embed__{embed_model_name}__{file_md5}__{(sheet_name or 'all') }__{md5_of_bytes(columns_sig.encode())}.csv"
+    cache_name = f"embed__{embed_model_name}__{file_md5}__{(sheet_name or 'all')}__{md5_of_bytes(columns_sig.encode())}.csv"
     cache_path = os.path.join(DATA_DIR, cache_name)
 
     if os.path.isfile(cache_path):
         st.info(f"📦 캐시 로드: {os.path.basename(cache_path)}")
         df = pd.read_csv(cache_path)
         df["embedding"] = df["embedding"].apply(safe_parse_embedding)
+        st.caption(f"임베딩 캐시 포함 시트 예시: {', '.join(sorted(df['sheet'].astype(str).unique())[:10])}")
         return df
 
     xl = pd.ExcelFile(io.BytesIO(xls_bytes))
-    sheets = [sheet_name] if (sheet_name and sheet_name in xl.sheet_names) else xl.sheet_names
+    # 전체 시트 대상일 경우 '금기표현'은 자동 제외
+    all_sheets = [s for s in xl.sheet_names if s != "금기표현"]
+    sheets = [sheet_name] if (sheet_name and sheet_name in xl.sheet_names) else all_sheets
+    st.info(f"임베딩 대상 시트: {', '.join(sheets)}")
 
     rows = []
     for sh in sheets:
@@ -251,7 +256,7 @@ def build_or_load_embeddings_from_excel(
                 "row_index": ridx,
                 "context": context,
                 "answer": answer,
-                "ward": ward_from_this_sheet,
+                "ward": ward_from_this_sheet,     # ✅ 캐시에 저장
                 "embedding": emb
             })
             if (ridx % 20) == 19: time.sleep(0.03)
@@ -260,6 +265,7 @@ def build_or_load_embeddings_from_excel(
     tmp = df.copy(); tmp["embedding"] = tmp["embedding"].apply(json.dumps)
     tmp.to_csv(cache_path, index=False, encoding="utf-8-sig")
     st.success(f"✅ 임베딩 생성 완료 → {os.path.basename(cache_path)}")
+    st.caption(f"임베딩 포함 시트: {', '.join(sorted(df['sheet'].astype(str).unique()))}")
     return df
 
 @st.cache_data(show_spinner=True)
@@ -531,7 +537,7 @@ if st.session_state["excel_df"] is None:
             cleaned_ctx = [c for c in sel_ctx if c != sel_ans and not any(k in str(c) for k in ANSWER_TOKENS)]
             df_embed = build_or_load_embeddings_from_excel(
                 xls_bytes=xls_bytes,
-                sheet_name=(sheet_input or None) if sheet_input else None,  # 빈 값이면 전체 시트
+                sheet_name=(sheet_input or None) if sheet_input else None,  # 빈 값이면 전체 시트(금기표현 제외)
                 context_cols=cleaned_ctx if cleaned_ctx else [c for c in cols[:3] if c != sel_ans],
                 answer_col=(None if sel_ans == "<선택 안 함>" else sel_ans),
                 embed_model_name=EMBED_MODEL
@@ -559,6 +565,38 @@ unique_wards = sorted([w for w in df_embed["ward_norm"].dropna().unique().tolist
 if not unique_wards or set(unique_wards) == {"공통"}:
     df_embed["ward_norm"] = df_embed["sheet"].map(ward_from_sheet).map(normalize_ward)
     unique_wards = sorted([w for w in df_embed["ward_norm"].dropna().unique().tolist() if str(w).strip()])
+
+# ---- 실제 엑셀 시트 수 vs 임베딩에 담긴 시트 수 비교 → 자동 복구 버튼 ----
+try:
+    xl_for_check = pd.ExcelFile(io.BytesIO(xls_bytes))
+    all_sheets = [s for s in xl_for_check.sheet_names if s != "금기표현"]
+    embed_sheets = sorted([str(s) for s in df_embed["sheet"].astype(str).unique()])
+    if len(set(embed_sheets)) < len(all_sheets):
+        st.warning(f"임베딩에 포함된 시트({len(set(embed_sheets))}): {', '.join(embed_sheets)} / "
+                   f"엑셀 시트({len(all_sheets)}): {', '.join(all_sheets)}")
+        if st.button("🔁 전체 시트로 다시 임베딩"):
+            # 기본 컨텍스트/정답 열 재구성 후 전체 시트 임베딩
+            first_df = xl_for_check.parse(all_sheets[0]).fillna("")
+            if st.session_state.get("context_cols"):
+                ctx_cols = [c for c in st.session_state["context_cols"] if c in first_df.columns]
+            else:
+                ctx_cols, _ans_guess = guess_columns(first_df)
+            ans_col = st.session_state.get("answer_col")
+            if (not ans_col) or (ans_col not in first_df.columns):
+                _, ans_col_guess = guess_columns(first_df)
+                ans_col = ans_col or ans_col_guess
+            df_embed_new = build_or_load_embeddings_from_excel(
+                xls_bytes=xls_bytes,
+                sheet_name=None,  # 전체 시트
+                context_cols=ctx_cols,
+                answer_col=ans_col,
+                embed_model_name=EMBED_MODEL
+            )
+            st.session_state["excel_df"] = df_embed_new
+            df_embed = df_embed_new
+            st.experimental_rerun()
+except Exception:
+    pass
 
 # 프리셋→필터 적용 버튼을 눌렀다면 동기화
 if st.session_state.get("preset_to_filter"):
@@ -639,7 +677,7 @@ if mode == "질문(학습)":
     if send and q.strip():
         topk = search_top_k(df_embed, q.strip(), k=3)
         st.session_state["last_topk"] = topk
-        st.session_state["last_topk_source"] = "ask"  # ← 검색에서 온 것 표시(선택적)
+        st.session_state["last_topk_source"] = "ask"
         msgs = make_messages_for_answer(topk, q.strip(), workplace, forb_prompt)
         ans = call_llm(msgs)
         message(q.strip(), is_user=True, key="ask_u_"+str(time.time()))
